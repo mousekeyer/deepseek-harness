@@ -1,0 +1,13 @@
+# Runtime settings for the DeepSeek Harness web service.
+#
+# The unit passes these values to `dsh web`. Both are required: leave them
+# empty and the service fails to start with an argument error.
+
+# Address to bind. `dsh web` accepts a literal IPv4 or IPv6 address only and
+# rejects wildcards on purpose, because binding every interface exposes agent
+# code execution to the network. Reach the service through a reverse proxy or
+# an SSH tunnel when it must be used remotely.
+DSH_WEB_HOST=127.0.0.1
+
+# TCP port to listen on.
+DSH_WEB_PORT=3080

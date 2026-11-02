@@ -1,0 +1,33 @@
+[Unit]
+Description=DeepSeek Harness web application
+Documentation=https://github.com/deepseek-ai/deepseek-harness
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dsh
+Group=dsh
+# `dsh web` writes its profile state, logs and cordis.patch.yml under DSH_HOME.
+Environment=DSH_HOME=/var/lib/deepseek-harness
+EnvironmentFile=-/etc/sysconfig/dsh
+# --host accepts a literal address only and refuses wildcards on purpose:
+# binding every interface would expose agent code execution to the network.
+ExecStart=/usr/bin/dsh web --host ${DSH_WEB_HOST} --port ${DSH_WEB_PORT} --no-open
+Restart=on-failure
+RestartSec=5
+# The agent executes model-directed commands; give it its own slice of devices
+# and the kernel protections that do not depend on the sandbox runner.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/deepseek-harness
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
