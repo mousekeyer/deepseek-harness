@@ -7,10 +7,12 @@ import { createReadStream } from 'node:fs'
 import { readFile, stat } from 'node:fs/promises'
 import { basename, join, resolve } from 'node:path'
 import { dump, load } from 'js-yaml'
+import type { DesktopAutoUpdateTarget } from '@deepseek-ai/dsh-desktop-publisher/desktop-auto-update-environment.mjs'
 import {
   desktopBuildRecordFilename,
   desktopLatestInstallerFilename,
   desktopUpdateMetadataFilename,
+  releaseTargetName,
   resolveDesktopUploadConfig,
 } from '@deepseek-ai/dsh-desktop-publisher/desktop-auto-update-environment.mjs'
 import { desktopTargetBuildPaths } from './desktop-build-paths.mjs'
@@ -24,7 +26,7 @@ const TARGETS = {
   'mac-arm64': { platform: 'darwin', arch: 'arm64', os: 'mac' },
   'mac-x64': { platform: 'darwin', arch: 'x64', os: 'mac' },
   'win-x64': { platform: 'win32', arch: 'x64', os: 'win' },
-} as const satisfies Record<DesktopPackageTargetName, {
+} as const satisfies Record<DesktopAutoUpdateTarget, {
   readonly platform: NodeJS.Platform
   readonly arch: string
   readonly os: string
@@ -159,10 +161,8 @@ export async function createDesktopUploadPlan(
   targetName: DesktopPackageTargetName,
   options: DesktopUploadPlanOptions = {},
 ): Promise<DesktopUploadPlan> {
-  const target = TARGETS[targetName]
-  if (target === undefined) {
-    throw new Error(`desktop upload: unsupported target ${String(targetName)}`)
-  }
+  const releaseTarget = releaseTargetName(targetName)
+  const target = TARGETS[releaseTarget]
   const environment = options.environment ?? process.env
   const repositoryRoot = options.repositoryRoot ?? REPOSITORY_ROOT
   const appRoot = options.appRoot ?? APP_ROOT
@@ -175,7 +175,7 @@ export async function createDesktopUploadPlan(
 
   const update = resolveDesktopUploadConfig(environment, target.platform, target.arch)
   const buildRecord = await jsonFile(
-    join(artifactsRoot, desktopBuildRecordFilename(targetName)),
+    join(artifactsRoot, desktopBuildRecordFilename(releaseTarget)),
     `${targetName} package completion record`,
   )
   // Packaging wrote the version it published; reading it back keeps release settings out of shell variables.
@@ -255,11 +255,11 @@ export async function createDesktopUploadPlan(
     contents: dump(published),
   }
   artifacts.push(channelArtifact)
-  const latestFilename = desktopLatestInstallerFilename(targetName)
+  const latestFilename = desktopLatestInstallerFilename(releaseTarget)
   const latestKey = `desktop/${latestFilename}`
   return {
     environment: update.environment,
-    target: targetName,
+    target: releaseTarget,
     version: buildVersion,
     publicUrl: options.latest ? `${update.origin}/${latestKey}` : update.publicUrl,
     bucket: update.bucket,

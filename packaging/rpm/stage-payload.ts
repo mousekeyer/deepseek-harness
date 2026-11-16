@@ -16,9 +16,10 @@
  * materialization, then workspace duplicate removal.
  */
 import { execFileSync } from 'node:child_process'
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs'
-import { join, relative, resolve, sep } from 'node:path'
+import { chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, rmdirSync } from 'node:fs'
+import { dirname, join, relative, resolve, sep } from 'node:path'
 import { parseArgs } from 'node:util'
+import { load } from 'js-yaml'
 import { deduplicateStagedWorkspacePackages, materializeStagedLinks } from '../../scripts/build-exe-for-python-sdk-staging.ts'
 import { pnpmInvocation, restoreLegacyHoists } from '../../scripts/executable-packaging.ts'
 import { downloadNodeRuntime } from '../../scripts/primary-runtime/prepare.ts'
@@ -47,6 +48,27 @@ function prune(directory: string, removed: string[]): void {
   }
 }
 
+/**
+ * Delete directories left with no entries below a package tree.
+ *
+ * Pruning declarations empties the `lib/types` and `typings` trees, and several
+ * upstream packages ship such directories empty in the first place. An installed
+ * payload is read-only, so nothing writes into them at runtime, and every one of
+ * them costs an entry in the RPM file manifest that names no content.
+ */
+function removeEmptyDirectories(directory: string, removed: string[]): void {
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue
+    const path = join(directory, entry.name)
+    if (PRUNE_EXEMPT.some(exempt => path.includes(exempt))) continue
+    removeEmptyDirectories(path, removed)
+    if (readdirSync(path).length === 0) {
+      rmdirSync(path)
+      removed.push(path)
+    }
+  }
+}
+
 /** Return every symbolic link below a directory, so a packaged tree can be proven link-free. */
 function symlinksBelow(directory: string, found: string[] = []): string[] {
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -58,8 +80,162 @@ function symlinksBelow(directory: string, found: string[] = []): string[] {
   return found
 }
 
+/**
+ * Give the tree the permissions a system package needs.
+ *
+ * The checkout is built under whatever umask the build host uses (a restrictive
+ * 0077 turns every produced file into 0600), and the package installs the tree
+ * as root:root. Files nobody else can read would make the installed CLI unusable
+ * for every non-root account, so the executable bit is derived from the owner
+ * bit and everything else is normalised to 0644/0755.
+ */
+function normalizePermissions(directory: string): void {
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name)
+    if (entry.isDirectory()) {
+      chmodSync(path, 0o755)
+      normalizePermissions(path)
+    } else if (!entry.isSymbolicLink()) {
+      const executable = (lstatSync(path).mode & 0o100) !== 0
+      chmodSync(path, executable ? 0o755 : 0o644)
+    }
+  }
+}
+
 function fail(message: string): never {
   throw new Error(`stage-payload: ${message}`)
+}
+
+/** Every installed package directory of a staged `node_modules`, including scopes. */
+function installedPackages(modules: string): string[] {
+  const found: string[] = []
+  for (const entry of readdirSync(modules, { withFileTypes: true })) {
+    if (!entry.isDirectory() && !entry.isSymbolicLink()) continue
+    if (entry.name === '.bin' || entry.name === '.pnpm') continue
+    const path = join(modules, entry.name)
+    if (entry.name.startsWith('@')) {
+      for (const scoped of readdirSync(path, { withFileTypes: true })) {
+        if (scoped.isDirectory()) found.push(join(path, scoped.name))
+      }
+      continue
+    }
+    found.push(path)
+  }
+  return found
+}
+
+/**
+ * Report every dependency a staged package declares without a resolvable copy.
+ *
+ * The deploy uses `link-workspace-packages` with workspace hoisting disabled, so
+ * it only roots the deploy target's *direct* dependencies: a transitive
+ * workspace package (for example @deepseek-ai/cosmokit, reached through
+ * @deepseek-ai/cordis) is declared but never staged. Node resolves such an
+ * import from the consuming package upwards, so a payload that misses one starts
+ * with ERR_MODULE_NOT_FOUND — and nothing else in the pipeline notices, because
+ * `node` finds a copy on any machine that also has the checkout installed.
+ *
+ * Peer dependencies are checked too: pnpm records them as declarations, and a
+ * peer that only the workspace root installs is exactly as absent from the
+ * payload as a plain dependency would be.
+ *
+ * @param app - staged application root whose `node_modules` holds the closure.
+ * @returns dependency name to the staged packages that declare it.
+ */
+function missingDependencies(app: string): Map<string, string[]> {
+  const modules = join(app, 'node_modules')
+  const missing = new Map<string, string[]>()
+  for (const directory of installedPackages(modules)) {
+    const manifestPath = join(directory, 'package.json')
+    if (!existsSync(manifestPath)) continue
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+      dependencies?: Record<string, string>
+      peerDependencies?: Record<string, string>
+      peerDependenciesMeta?: Record<string, { optional?: boolean }>
+    }
+    const optionalPeers = Object.entries(manifest.peerDependenciesMeta ?? {})
+      .filter(([, meta]) => meta.optional === true)
+      .map(([name]) => name)
+    const declared = [
+      ...Object.keys(manifest.dependencies ?? {}),
+      ...Object.keys(manifest.peerDependencies ?? {}).filter(name => !optionalPeers.includes(name)),
+    ]
+    for (const name of declared) {
+      const candidates = [
+        join(modules, name),
+        join(directory, 'node_modules', name),
+        join(dirname(directory), 'node_modules', name),
+      ]
+      if (candidates.some(candidate => existsSync(candidate))) continue
+      const dependents = missing.get(name) ?? []
+      dependents.push(relative(app, directory))
+      missing.set(name, dependents)
+    }
+  }
+  return missing
+}
+
+/** Map every workspace package name to its directory, following pnpm-workspace.yaml. */
+function workspacePackages(root: string): Map<string, string> {
+  const manifest = load(readFileSync(join(root, 'pnpm-workspace.yaml'), 'utf8')) as { packages?: string[] }
+  const packages = new Map<string, string>()
+  for (const pattern of manifest.packages ?? []) {
+    let directories = [root]
+    for (const segment of pattern.split('/')) {
+      const next: string[] = []
+      for (const directory of directories) {
+        if (segment !== '*') {
+          next.push(join(directory, segment))
+          continue
+        }
+        if (!existsSync(directory)) continue
+        for (const entry of readdirSync(directory, { withFileTypes: true })) {
+          if (entry.isDirectory()) next.push(join(directory, entry.name))
+        }
+      }
+      directories = next
+    }
+    // An entry that is not itself a package (a container of packages) is
+    // skipped by the manifest check below.
+    for (const directory of directories) {
+      const manifestPath = join(directory, 'package.json')
+      if (!existsSync(manifestPath)) continue
+      const { name } = JSON.parse(readFileSync(manifestPath, 'utf8')) as { name: string }
+      packages.set(name, directory)
+    }
+  }
+  return packages
+}
+
+/**
+ * Fill in transitive workspace dependencies the deploy left out.
+ *
+ * Only workspace packages are restored: their sources are in the checkout and
+ * their published form is what the workspace link would have resolved to. A
+ * third-party name that is missing means the deploy itself is wrong and the
+ * build stops, because guessing a version here would ship an unverified tree.
+ */
+function completeClosure(app: string, root: string): string[] {
+  const packages = workspacePackages(root)
+  const restored: string[] = []
+  for (const [name, dependents] of missingDependencies(app)) {
+    const source = packages.get(name)
+    if (source === undefined) {
+      fail(`${name} is declared by ${dependents.join(', ')} but absent from the closure and from the workspace`)
+    }
+    const destination = join(app, 'node_modules', name)
+    const nestedNodeModules = join(source, 'node_modules')
+    mkdirSync(dirname(destination), { recursive: true })
+    cpSync(source, destination, {
+      recursive: true,
+      dereference: true,
+      filter: path => path !== nestedNodeModules && !path.startsWith(nestedNodeModules + sep),
+    })
+    restored.push(name)
+  }
+  const remaining = missingDependencies(app)
+  if (remaining.size > 0) fail(`the closure is still incomplete: ${[...remaining.keys()].join(', ')}`)
+  return restored
 }
 
 const { values } = parseArgs({
@@ -130,12 +306,24 @@ if (restored.length > 0) console.log(`stage-payload: restored ${String(restored.
 await materializeStagedLinks(app)
 await deduplicateStagedWorkspacePackages(app, root)
 
+// The deploy roots only the deploy target's direct dependencies, so a
+// transitive workspace package can be declared and never staged. Nothing
+// downstream catches that: the packed tree starts with ERR_MODULE_NOT_FOUND,
+// while any host that also has the checkout installed resolves the import from
+// its own node_modules and reports success.
+const completed = completeClosure(app, root)
+if (completed.length > 0) {
+  console.log(`stage-payload: completed the closure with ${String(completed.length)} workspace packages: ${completed.join(', ')}`)
+}
+
 const removed: string[] = []
 prune(join(app, 'node_modules'), removed)
+const emptied: string[] = []
+removeEmptyDirectories(join(app, 'node_modules'), emptied)
 // The deploy target carries the project's own docs; the spec ships the
 // repository copies instead.
 for (const name of ['README.md', 'README.zh.md', 'README.i18n.yaml']) rmSync(join(app, name), { force: true })
-console.log(`stage-payload: pruned ${String(removed.length)} documentation and declaration files`)
+console.log(`stage-payload: pruned ${String(removed.length)} documentation and declaration files and ${String(emptied.length)} emptied directories`)
 
 const links = symlinksBelow(app)
 if (links.length > 0) fail(`staged payload still contains ${String(links.length)} symbolic links, first: ${links[0]}`)
@@ -163,6 +351,12 @@ for (const name of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) {
   if (!existsSync(source)) fail(`missing ${name} at the repository root`)
   copyFileSync(source, join(payload, name))
 }
+
+// A restrictive host umask would otherwise ship 0600 files inside a root:root
+// package, which no non-root account could read.
+chmodSync(payload, 0o755)
+normalizePermissions(payload)
+console.log('stage-payload: normalized permissions to 0755 directories and 0644/0755 files')
 
 // The checks the spec repeats are asserted here first, while the failure still
 // names the phase that broke.

@@ -1,0 +1,29 @@
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -1,5 +1,5 @@
+ import { createRequire } from "node:module";
+-import { closeSync, constants, createWriteStream, lstatSync, readSync, readdirSync, statSync } from "node:fs";
++import { closeSync, constants, createWriteStream, existsSync, lstatSync, readSync, readdirSync, statSync } from "node:fs";
+ import { copyFile, lstat, mkdir, mkdtemp, open, readFile, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+ import { homedir, tmpdir } from "node:os";
+ import { dirname, extname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
+@@ -1573,7 +1573,18 @@
+ * @returns true when at least one resolution directory holds the package.
+ */
+ function installedPackageExists(name) {
+-	return (require.resolve.paths(name) ?? []).some((directory) => lstatSync(join(directory, name), { throwIfNoEntry: false }) !== void 0);
++	return (require.resolve.paths(name) ?? []).some((directory) => {
++		const path = join(directory, name);
++		// Electron answers a missing asar entry with null instead of undefined.
++		if (existsSync(path)) return true;
++		try {
++			lstatSync(path);
++			return true;
++		}
++		catch {
++			return false;
++		}
++	});
+ }
+ /**
+ * Return the optional package target for the current process ABI.

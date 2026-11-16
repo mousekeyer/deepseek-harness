@@ -60,6 +60,13 @@ export function resolveDesktopAutoUpdateTarget(
 ): DesktopAutoUpdateTarget
 
 /**
+ * Narrow a build target to one that publishes an update feed.
+ * @param target - Build target directory name.
+ * @returns The same target, typed as a release target.
+ */
+export function releaseTargetName(target: string): DesktopAutoUpdateTarget
+
+/**
  * Return the local completion record filename for one packaged target.
  * @param target - Supported release target.
  * @returns Filename stored beside electron-builder artifacts.

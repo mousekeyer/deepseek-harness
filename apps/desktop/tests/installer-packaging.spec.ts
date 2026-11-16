@@ -60,7 +60,7 @@ describe('installer preparation preserves application dependencies', () => {
       const aboutIcon = config.extraResources.find(resource => resource.to === 'icon.png')
       expect(aboutIcon).toBeDefined()
       expect(readFileSync(aboutIcon!.from)).toEqual(readFileSync(new URL('../resources/icon-windows.png', import.meta.url)))
-      // Only the Windows package carries the tray bitmaps; macOS keeps the Dock.
+      // Tray glyphs are platform-specific; macOS keeps the Dock.
       const trayIcon = config.extraResources.find(resource => resource.to === 'tray.ico')
       if (platform === 'win32') {
         expect(readFileSync(trayIcon!.from)).toEqual(readFileSync(new URL('../resources/tray-windows.ico', import.meta.url)))
@@ -87,6 +87,20 @@ describe('installer preparation preserves application dependencies', () => {
       vi.unstubAllEnvs()
       vi.restoreAllMocks()
     }
+  })
+
+  it('ships standard launcher icons and the Linux tray glyph', async () => {
+    const { createElectronBuilderConfig } = await import('../scripts/electron-builder-config.mjs')
+    const config = createElectronBuilderConfig({
+      DSH_DESKTOP_APP_ID: 'com.example.installer',
+      DSH_DESKTOP_TARGET_PLATFORM: 'linux',
+      DSH_DESKTOP_TARGET_ARCH: 'x64',
+      DSH_DESKTOP_UNSIGNED: '1',
+    }, 'linux', 'x64')
+    expect(config.linux.icon).toMatch(/linux-icons$/u)
+    const trayIcon = config.extraResources.find(resource => resource.to === 'tray.png')
+    expect(readFileSync(trayIcon!.from)).toEqual(readFileSync(new URL('../resources/tray-linux.png', import.meta.url)))
+    expect(config.extraResources.find(resource => resource.to === 'tray.ico')).toBeUndefined()
   })
 
   it('names unsigned Windows artifacts so they cannot pass for release builds', async () => {

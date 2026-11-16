@@ -11,6 +11,10 @@ Group=dsh
 # `dsh web` writes its profile state, logs and cordis.patch.yml under DSH_HOME.
 Environment=DSH_HOME=/var/lib/deepseek-harness
 EnvironmentFile=-/etc/sysconfig/dsh
+# Relative config paths resolve against the process working directory, which
+# systemd would otherwise leave at /. The state directory is the only path this
+# service may write, so it is also the working directory.
+WorkingDirectory=/var/lib/deepseek-harness
 # --host accepts a literal address only and refuses wildcards on purpose:
 # binding every interface would expose agent code execution to the network.
 ExecStart=/usr/bin/dsh web --host ${DSH_WEB_HOST} --port ${DSH_WEB_PORT} --no-open

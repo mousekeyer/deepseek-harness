@@ -85,7 +85,9 @@ export async function uploadDesktopTarget(args: string[]): Promise<void> {
   }
   let fileEnvironment: NodeJS.ProcessEnv
   try {
-    fileEnvironment = loadDesktopPackageEnvironment(desktopTargetPlatform(name).platform)
+    const { platform } = desktopTargetPlatform(name)
+    if (platform === 'linux') throw new DesktopUploadUsageError('desktop upload: linux-x64 publishes no update feed')
+    fileEnvironment = loadDesktopPackageEnvironment(platform)
   } catch (error) {
     throw new DesktopUploadUsageError('Cannot load target dotenv; check the target dotenv file and release settings.')
   }

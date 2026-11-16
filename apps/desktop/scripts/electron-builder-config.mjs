@@ -1,7 +1,7 @@
 import { readInstallerLocales, renderInstallerStrings } from './installer-locales.mjs'
 import { officePackageDirectories } from '../../../scripts/libreoffice-packages.mjs'
 import { X509Certificate } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { chmodSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { readFile, writeFile } from 'node:fs/promises'
 import { join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -36,6 +36,23 @@ import {
 } from './macos-app-update-config.mjs'
 
 /**
+ * Give every packaged file a mode the installing user can read.
+ *
+ * electron-builder preserves the modes it finds on the build host, so a restrictive umask there
+ * produces a package whose app.asar and wasm assets are unreadable after a root install. Executable
+ * bits are kept: a file the build host marked executable stays executable.
+ * @param {string} directory - Packaged application directory.
+ */
+function normalizePackagedModes(directory) {
+  for (const entry of readdirSync(directory, { recursive: true, withFileTypes: true })) {
+    if (!entry.isFile()) continue
+    const path = join(entry.parentPath, entry.name)
+    const mode = statSync(path).mode
+    chmodSync(path, (mode & 0o100) === 0 ? 0o644 : 0o755)
+  }
+}
+
+/**
  * Create electron-builder configuration from one release environment.
  * @param {NodeJS.ProcessEnv} env - Packaging environment.
  * @param {NodeJS.Platform} hostPlatform - Build-host platform used when no explicit target is present.
@@ -66,7 +83,11 @@ export function createElectronBuilderConfig(
   if (skipNotarization && (unsigned || resolvedPlatform !== 'darwin')) throw new Error('Skipping notarization requires a signed macOS build')
   const packagesMacOS = targetPlatform === 'darwin' || (targetPlatform === undefined && hostPlatform === 'darwin')
   const packagesWindows = resolvedPlatform === 'win32'
-  const policy = packagesMacOS && unsigned ? undefined : resolveDesktopPolicyEnvironment(env)
+  if (resolvedPlatform === 'linux' && !unsigned) {
+    throw new Error('desktop package: linux-x64 ships unsigned only; pass --unsigned')
+  }
+  const packagesLinux = resolvedPlatform === 'linux'
+  const policy = (packagesMacOS || packagesLinux) && unsigned ? undefined : resolveDesktopPolicyEnvironment(env)
   if (resolvedPlatform === 'win32') installWindowsDirectoryInstaller()
   const macOSSigning = packagesMacOS && !unsigned ? resolveMacOSSigningEnvironment(env) : undefined
   if (packagesMacOS && !unsigned && !skipNotarization) resolveMacOSNotarizationEnvironment(env)
@@ -111,7 +132,13 @@ export function createElectronBuilderConfig(
     protocols: [{ name: 'DeepSeek Harness', schemes: ['dsh'] }],
     extraMetadata: {
       dshDesktopAppId: appId,
+      // Electron takes the Linux app_id / window class from this field, and electron-builder takes
+      // StartupWMClass from it. Without it both fall back to the scoped package name, so running
+      // windows never associate with the installed entry.
+      desktopName: 'deepseek-harness.desktop',
       dshDesktopUpdateChannel: update?.channel ?? 'nightly',
+      // The rpm and deb maintainer scripts require a project URL; the desktop manifest has none.
+      homepage: 'https://github.com/deepseek-ai/deepseek-harness',
       ...(policy === undefined ? {} : { dshMandatoryUpdatePolicy: policy }),
       ...buildVersion === productVersion ? {} : { version: buildVersion },
       ...packaged === undefined ? {} : { dshBuildCommit: packaged.commit, dshBuildDirty: packaged.dirty },
@@ -160,8 +187,10 @@ export function createElectronBuilderConfig(
     extraResources: [
       { from: buildPaths.runtime, to: 'runtime' },
       { from: fileURLToPath(new URL('../resources/icon-windows.png', import.meta.url)), to: 'icon.png' },
-      // Windows tray bitmaps; macOS keeps the Dock and ships no menu bar icon.
+      // Tray glyphs are platform-specific: Windows selects a bitmap from the multi-size ICO,
+      // Linux status bars take a PNG, and macOS keeps the Dock and ships no menu bar icon.
       ...(packagesWindows ? [{ from: fileURLToPath(new URL('../resources/tray-windows.ico', import.meta.url)), to: 'tray.ico' }] : []),
+      ...(packagesLinux ? [{ from: fileURLToPath(new URL('../resources/tray-linux.png', import.meta.url)), to: 'tray.png' }] : []),
     ],
     mac: {
       icon: fileURLToPath(new URL('../resources/icon-macos.png', import.meta.url)),
@@ -214,6 +243,10 @@ export function createElectronBuilderConfig(
         preparedRuntimeVersion ?? productVersion, { platform: resolvedPlatform, arch: resolvedArch })
       // Unsigned Windows builds skip electron-builder's afterSign hook.
       if (packagesWindows && unsigned) await verifyWindowsAsarUnpack(buildPaths.dsh, resourcesDir, windowsCode)
+      // electron-builder copies whatever modes the build host has. A restrictive umask on the build
+      // host therefore ships a package whose app.asar and wasm assets are unreadable to the user who
+      // installs it, so normalize every packaged file to a world-readable mode.
+      normalizePackagedModes(context.appOutDir)
     },
     afterSign: async context => {
       if (windowsSigner !== undefined) {
@@ -255,8 +288,22 @@ export function createElectronBuilderConfig(
       target: ['nsis'],
     },
     linux: {
+      // Standard hicolor sizes only: the launcher resolves icons from directories listed in
+      // hicolor/index.theme, so a single oversized PNG is never found.
+      icon: fileURLToPath(new URL('../resources/linux-icons', import.meta.url)),
+      executableName: 'deepseek-harness',
+      // Keep the .desktop filename equal to desktopName, so StartupWMClass, Electron's app_id and
+      // the installed file all name the same application.
+      syncDesktopName: true,
       category: 'Development',
-      target: ['AppImage'],
+      maintainer: 'DeepSeek Harness Packaging <packaging@localhost>',
+      target: ['AppImage', 'rpm'],
+    },
+    // Without this, fpm derives the rpm Name from productName ("DeepSeek Harness"), and rpm rejects
+    // a Name containing a space: "Tag takes single token only". packageName belongs to the
+    // per-format options block, not to the shared linux block.
+    rpm: {
+      packageName: 'deepseek-harness',
     },
     nsis: {
       uninstallDisplayName: '${productName}',

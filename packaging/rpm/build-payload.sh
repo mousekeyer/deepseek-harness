@@ -61,7 +61,6 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -n "$out" ] || out=$work
 mkdir -p -- "$work" "$out"
 work=$(cd -- "$work" && pwd)
 out=$(cd -- "$out" && pwd)
@@ -131,8 +130,17 @@ tar --create --gzip --file "$out/$payload.tar.gz" --directory "$work" "$payload"
 payload_sha256=$(sha256sum -- "$out/$payload.tar.gz" | cut -d' ' -f1)
 
 if [ "$skip_node" = 0 ]; then
-  echo "build-payload: smoke testing the payload entry point"
-  "$work/$payload/node/bin/node" "$work/$payload/app/lib/bin.js" --version
+  echo "build-payload: smoke testing the packed payload"
+  # The smoke test runs from the tarball, outside the checkout, with the module
+  # search path cleared: Node resolves an import from the consuming file
+  # upwards, so running the payload in place would find the build host's own
+  # node_modules and report success for a closure that is actually incomplete.
+  smoke=$(mktemp -d "${TMPDIR:-/tmp}/dsh-payload-smoke.XXXXXX")
+  trap 'rm -rf -- "$smoke"' EXIT
+  tar --extract --gzip --file "$out/$payload.tar.gz" --directory "$smoke"
+  version_out=$(cd -- "$smoke/$payload" && env -u NODE_PATH -u NODE_OPTIONS \
+    ./node/bin/node app/lib/bin.js --version)
+  echo "build-payload: payload reports $version_out"
 fi
 
 cat <<EOF
@@ -140,13 +148,17 @@ cat <<EOF
 build-payload: wrote $out/$payload.tar.gz
 build-payload: sha256 $payload_sha256
 
-Pin that digest by setting %global payload_sha256 in
+Pin that digest as %global payload_sha256 in
 packaging/rpm/deepseek-harness.spec; until then %prep only warns.
 
-Phase two copies that tarball into an rpmbuild tree:
+Phase two needs that tarball plus the two unit files in \$topdir/SOURCES:
 
-  rpmbuild -bb --define '_topdir $out/rpmbuild' packaging/rpm/deepseek-harness.spec
+  topdir=$out/rpmbuild
+  mkdir -p "\$topdir"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+  cp "$out/$payload.tar.gz" "$repo_root/packaging/rpm/dsh-web.service" \\
+     "$repo_root/packaging/rpm/dsh.sysconfig" "\$topdir/SOURCES/"
+  rpmbuild -bb --define "_topdir \$topdir" \\
+    "$repo_root/packaging/rpm/deepseek-harness.spec"
 
-with the tarball, packaging/rpm/dsh-web.service and packaging/rpm/dsh.sysconfig
-in \$rpmbuild/SOURCES/; see packaging/rpm/BUILD.md.
+See packaging/rpm/BUILD.md.
 EOF

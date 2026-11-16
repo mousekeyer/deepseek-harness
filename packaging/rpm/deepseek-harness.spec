@@ -5,22 +5,23 @@
 # rpmbuild only unpacks Source0 and assembles files, so this spec never needs
 # network access, a Node toolchain, or a pnpm store inside the build root.
 #
-# Upstream version is 0.2.2-alpha.2. RPM forbids '-' in Version, so the
+# Upstream version is 0.2.2-alpha.3. RPM forbids '-' in Version, so the
 # prerelease separator becomes '~' (supported since rpm 4.10; EL9 ships 4.16),
-# which also sorts 0.2.2~alpha.2 before the eventual 0.2.2 final release.
-%global upstream_version 0.2.2-alpha.2
+# which also sorts 0.2.2~alpha.3 before the eventual 0.2.2 final release.
+%global upstream_version 0.2.2-alpha.3
 %global payload_dir deepseek-harness-%{upstream_version}-payload
 %global app_root %{_libexecdir}/deepseek-harness
 
 # SHA-256 of Source0, printed by build-payload.sh right after it writes the
 # tarball. Paste that value here so the payload is pinned by content, not by
-# filename: a rerun that changes the tree then fails in %prep instead of
+# filename: a rerun that changes the tree then fails in the prep section instead of
 # silently shipping something else under the same name.
 #
-# （待补充：phase one 首次构建后由 build-payload.sh 打印的 sha256）
-# While the placeholder is unchanged, %prep skips the check and prints a
+# Measured digest of dist-exe/rpm/deepseek-harness-0.2.2-alpha.3-payload.tar.gz
+# from the phase one build.
+# While the placeholder is unchanged, the prep section skips the check and prints a
 # warning, so an unpackaged source tree still builds.
-%global payload_sha256 PENDING
+%global payload_sha256 2cae476e91f9694df2314ab28df62952e871371e77fbd0a4ff2d745ba7d209e1
 
 # Bundled Node.js is the default because AlmaLinux 9 AppStream tops out at
 # nodejs 22 while this tree requires Node >= 24.9.0, and apps/cli/src/bin.ts
@@ -28,7 +29,7 @@
 # do nothing. `--without bundled_node` trades that for a nodejs dependency.
 %bcond_without bundled_node
 
-# %check is OFF by default, matching the packaging rules for this tree: the
+# The check section is OFF by default, matching the packaging rules for this tree: the
 # upstream test suite needs the development dependency closure that the payload
 # deliberately omits, and any check that fails aborts the build. Enable it with
 # `--with check` to run the smoke assertions below (see BUILD.md).
@@ -47,7 +48,7 @@
 %endif
 
 Name:           deepseek-harness
-Version:        0.2.2~alpha.2
+Version:        0.2.2~alpha.3
 Release:        1%{?dist}
 Summary:        DeepSeek Harness agent runtime and command line interface
 License:        MIT
@@ -63,7 +64,37 @@ ExclusiveArch:  x86_64 aarch64
 %global debug_package %{nil}
 %global _build_id_links none
 
-# Dependencies are left to rpm's ELF scanner: it derives the glibc, libstdc++
+# Three families of automatic dependency are wrong for this tree and are
+# filtered out below. Each would otherwise make the package uninstallable on a
+# plain AlmaLinux 9 system:
+#
+#   /usr/bin/node          brp-mangle-shebangs rewrites every `#!/usr/bin/env
+#                          node` line in the payload to `#!/usr/bin/node`, and
+#                          script.req then records a dependency on that path,
+#                          which only exists when a system nodejs package is
+#                          installed. The wrapper execs the bundled runtime
+#                          directly and never resolves `node` from $PATH.
+#   nodejs(abi16) ...      nodejs_native.req emits both ABI requirements for
+#   nodejs(v8-abi9) ...    every `.node` file under /usr/lib*/node_modules
+#                          without reading which ABI the module needs. These
+#                          addons are N-API (ABI-stable) and are loaded by the
+#                          bundled Node 24.21.0, not by a distro nodejs.
+#   libonnxruntime.so ...  sherpa-onnx-linux-x64 ships libonnxruntime.so whose
+#                          SONAME is the unversioned `libonnxruntime.so` while
+#                          the versioned symbols live under VERS_1.28.2, so
+#                          find-requires emits `libonnxruntime.so(VERS_1.28.2)
+#                          (64bit)` — a name that no file can provide, because
+#                          the provider's own provide is
+#                          `libonnxruntime.so.1.28.2(VERS_1.28.2)(64bit)`.
+#
+# The same libraries are excluded from the provide side: they are private to
+# the payload, resolved through $ORIGIN, and must not claim names in the
+# system-wide library namespace. `^nodejs[(]` cannot mask the explicit
+# `Requires: nodejs` of the non-bundled variant, which has no parenthesis.
+%global __requires_exclude ^/usr/bin/node$|^nodejs[(]|^libonnxruntime[.]so|^libsherpa-onnx
+%global __provides_exclude ^libonnxruntime[.]so|^libsherpa-onnx
+
+# Everything else is left to rpm's ELF scanner: it derives the glibc, libstdc++
 # and libgcc requirements of the bundled runtime and of the N-API addons from
 # the binaries themselves, which is more accurate than a hand-written list.
 %if %{with bundled_node}
@@ -106,7 +137,9 @@ depend on nodejs >= 24.9.0 instead.
 
 %if %{with web_service}
 This build also installs an optional systemd unit that serves the web
-frontend on 127.0.0.1:3080, and enables it at boot.
+frontend on 127.0.0.1:3080. AlmaLinux 9 ships a default preset that disables
+newly installed units and this package installs no preset of its own, so the
+service stays off until an administrator runs `systemctl enable --now dsh-web`.
 %endif
 
 %prep
@@ -129,7 +162,9 @@ fi
 # Nothing is compiled here. The JavaScript bundles, the web assets and the
 # native addons all arrive already built inside Source0; see BUILD.md for the
 # phase-one build that produces it. Refusing to pretend otherwise keeps the
-# deviation from "build from source" visible instead of hidden in %install.
+# deviation from "build from source" visible instead of hidden in the install
+# section. Note: rpm 4.16 also reads a section name written inside a comment
+# line, so section names must not appear literally in these comments.
 test -f app/package.json
 test -f app/lib/bin.js
 
@@ -177,13 +212,13 @@ install -d -m 0750 %{buildroot}%{_localstatedir}/lib/deepseek-harness
 %endif
 
 %check
-# DISABLED BY DEFAULT, ON PURPOSE (rules for this tree: %check is opt-in).
+# DISABLED BY DEFAULT, ON PURPOSE (rules for this tree: checks are opt-in).
 #
 # The upstream test suite is not runnable here: it needs the development
 # dependency closure, which the payload deliberately omits, so `pnpm test`
 # cannot execute inside the build root. What remains below are smoke
 # assertions over the assembled tree. They are still gated behind
-# `--with check` because a failing %check aborts the build, and the two
+# `--with check` because a failing check section aborts the build, and the two
 # conditions they depend on are environment facts rather than packaging facts:
 #
 #   * the wrapper can only run when a runtime exists inside the build root,
@@ -244,6 +279,9 @@ chown -R dsh:dsh %{_localstatedir}/lib/deepseek-harness || :
 # Replace the placeholder maintainer identity below with a real address before
 # submitting this package to any repository that records a packager.
 %changelog
+* Wed Nov 04 2026 DeepSeek Harness Packaging <packaging@localhost> - 0.2.2~alpha.3-1
+- Rebuild the RHEL 9 / AlmaLinux 9 package from upstream 0.2.2-alpha.3.
+
 * Mon Nov 02 2026 DeepSeek Harness Packaging <packaging@localhost> - 0.2.2~alpha.2-1
 - Initial RPM packaging of DeepSeek Harness for RHEL 9 / AlmaLinux 9.
 - Ship the production closure of @deepseek-ai/dsh with a pinned Node.js runtime.

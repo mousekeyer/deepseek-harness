@@ -7,8 +7,8 @@ has neither Node.js 24 nor network access inside the build root.
 
 | Phase | Host | What it does | Output |
 | --- | --- | --- | --- |
-| one | networked x86_64/aarch64 Linux with Node.js 24 + pnpm 11.28.5 | installs, builds, deploys, stages and tars the runtime tree | `deepseek-harness-0.2.2-alpha.2-payload.tar.gz` |
-| two | any EL9 host with `rpm-build` (no network needed) | unpacks that tarball and assembles the package | `deepseek-harness-0.2.2~alpha.2-1.el9.x86_64.rpm` |
+| one | networked x86_64/aarch64 Linux with Node.js 24 + pnpm 11.28.5 | installs, builds, deploys, stages and tars the runtime tree | `deepseek-harness-0.2.2-alpha.3-payload.tar.gz` |
+| two | any EL9 host with `rpm-build` (no network needed) | unpacks that tarball and assembles the package | `deepseek-harness-0.2.2~alpha.3-1.el9.x86_64.rpm` |
 
 Phase one is `build-payload.sh` plus `stage-payload.ts`; phase two is
 `deepseek-harness.spec`.
@@ -71,6 +71,15 @@ The script performs, in order:
    - restores the direct dependencies that pnpm's legacy hoister leaves beside
      the deploy source, materializes every deploy-time symlink into real files,
      and removes duplicate hoisted workspace copies,
+   - completes the dependency closure: `deploy --legacy` hoists only the direct
+     dependencies of `apps/cli`, so the transitive `dependencies` and the
+     non-optional `peerDependencies` of every staged package are re-checked and
+     the missing workspace packages are copied in from the checkout. A missing
+     package that is not part of the workspace aborts the build instead of
+     producing a payload that cannot boot,
+   - normalizes permissions to `0755` directories and `0644`/`0755` files, since
+     a payload staged under `umask 077` would otherwise install unreadable to
+     every user but root,
    - prunes `README*`, `CHANGELOG*`, `HISTORY*`, `*.map` and `*.d.ts` from
      `node_modules` (never from an `assets` directory),
    - asserts that no symbolic link survives,
@@ -78,13 +87,16 @@ The script performs, in order:
      (24.21.0, SHA-256 verified) unless `--node-from` or `--skip-node` is given,
    - asserts that `@deepseek-ai/dsh-web-frontend/dist/index.html` and the glibc
      N-API addon are present, and warns when `landlock-run` is absent.
-5. Tars the tree, then smoke tests it with the bundled runtime:
-   `node/bin/node app/lib/bin.js --version`.
+5. Tars the tree, then smoke tests it with the bundled runtime **from a fresh
+   extraction of the tarball**, outside the checkout and with `NODE_PATH`
+   cleared (`node/bin/node app/lib/bin.js --version`). Running the smoke test
+   in place would let Node resolve imports through the build host's own
+   `node_modules` and report success for an incomplete payload.
 
 The resulting tree is:
 
 ```
-deepseek-harness-0.2.2-alpha.2-payload/
+deepseek-harness-0.2.2-alpha.3-payload/
 ├── LICENSE
 ├── THIRD_PARTY_NOTICES.md
 ├── app/                      # @deepseek-ai/dsh plus its hoisted node_modules
@@ -104,7 +116,7 @@ On the EL9 host (or inside `mock`):
 sudo dnf install -y rpm-build rpmdevtools
 rpmdev-setuptree
 
-cp dist-exe/rpm/deepseek-harness-0.2.2-alpha.2-payload.tar.gz ~/rpmbuild/SOURCES/
+cp dist-exe/rpm/deepseek-harness-0.2.2-alpha.3-payload.tar.gz ~/rpmbuild/SOURCES/
 cp packaging/rpm/dsh-web.service packaging/rpm/dsh.sysconfig ~/rpmbuild/SOURCES/
 
 rpmbuild -bb packaging/rpm/deepseek-harness.spec
@@ -167,10 +179,10 @@ On a clean AlmaLinux 9 machine:
 
 ```sh
 # 1. install (unsigned build: no package signature, so skip the check)
-sudo dnf install -y --nogpgcheck ./deepseek-harness-0.2.2~alpha.2-1.el9.x86_64.rpm
+sudo dnf install -y --nogpgcheck ./deepseek-harness-0.2.2~alpha.3-1.el9.x86_64.rpm
 
 # 2. the CLI resolves its own runtime and version
-dsh --version                 # 0.2.2-alpha.2
+dsh --version                 # 0.2.2-alpha.3
 rpm -q --provides deepseek-harness | grep -E 'bundled\(nodejs\)'
 
 # 3. a profile boots offline, with no pnpm and no registry access
@@ -196,6 +208,21 @@ test ! -e /usr/libexec/deepseek-harness && test ! -e /usr/bin/dsh && echo remove
 that directory and removal leaves it in place. `--with web_service` additionally
 owns `/var/lib/deepseek-harness` and the `dsh` user, which `dnf remove` also
 leaves behind.
+
+**The service starts disabled.** AlmaLinux 9 ships `/usr/lib/systemd/system-preset/99-default-disable.preset`
+(`disable *`) and this package installs no preset of its own, so
+`%systemd_post` only applies the preset mask. Enable it explicitly:
+
+```sh
+sudo systemctl enable --now dsh-web
+sudo systemctl status dsh-web
+curl --fail --silent http://127.0.0.1:3080/ | head -5
+```
+
+`/etc/sysconfig/dsh` is the `EnvironmentFile` for that unit; it sets
+`DSH_WEB_HOST` and `DSH_WEB_PORT`. `DSH_HOME` is fixed to
+`/var/lib/deepseek-harness` in the unit (the service account's home and the one
+path the sandbox lets it write), so changing `DSH_HOME` there has no effect.
 
 Common failure modes:
 
@@ -231,12 +258,12 @@ fork. Keep that boundary intact:
    and the root manifest carry the same version. The spec repeats it twice:
 
    ```spec
-   %global upstream_version 0.2.2-alpha.2
-   Version:        0.2.2~alpha.2
+   %global upstream_version 0.2.2-alpha.3
+   Version:        0.2.2~alpha.3
    ```
 
    Both must move together, and pre-release separators must stay `~` in
-   `Version:` so that `0.2.2~alpha.2 < 0.2.2`. `dsh --version` prints the
+   `Version:` so that `0.2.2~alpha.3 < 0.2.2`. `dsh --version` prints the
    upstream string, which is what `%check` compares against
    `%{upstream_version}`.
 
@@ -275,7 +302,7 @@ fork. Keep that boundary intact:
    ```
 
    Add a `%changelog` entry in the same commit, with the version as built
-   (`0.2.2~alpha.2-1`). A version bump always invalidates `payload_sha256`, so
+   (`0.2.2~alpha.3-1`). A version bump always invalidates `payload_sha256`, so
    the digest must be refreshed in the same commit — otherwise `%prep` fails
    with `Source0 checksum mismatch`.
 
